@@ -58,8 +58,8 @@ class AsyncClient:
         queue = self.pending_responses[request_id] = asyncio.Queue()
         await self.socket.send(request_text)
 
-        futures = [queue.get(), self.receiver]
-        done, pending = await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
+        tasks = [queue.get(), self.receiver]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
         response = None
         for task in done:
@@ -78,34 +78,29 @@ class OrderBook:
         self.instrument_name = instrument_name
         self.access_token = None
 
-    async def login(self):
-        response = await self.client.request(
+    async def auth(self):
+        response = await self.request(
             "public/auth", grant_type="client_credentials", client_id=client_id, client_secret=client_secret
         )
         try:
             result = response["result"]
             self.access_token = result["access_token"]
-            print("auth token", self.access_token)
+            print("access token:", self.access_token)
         except KeyError:
             raise Exception(f"Auth error: {response}")
 
     async def bid_ask(self):
-        response = await self.client.request("public/ticker", instrument_name=self.instrument_name)
+        response = await self.request("public/ticker", instrument_name=self.instrument_name)
         result = response["result"]
         bid, ask = result["best_bid_price"], result["best_ask_price"]
         return bid, ask
 
     async def subscribe(self):
-        await self.client.request(
-            "private/subscribe",
-            access_token=self.access_token,
-            channels=[f"user.orders.{self.instrument_name}.raw"],
-        )
+        await self.request("private/subscribe", channels=[f"user.orders.{self.instrument_name}.raw"])
 
     async def limit_order(self, way: t.Literal["buy", "sell"], amount: int, price: float):
-        await self.client.request(
+        await self.request(
             f"private/{way}",
-            access_token=self.access_token,
             instrument_name=self.instrument_name,
             amount=amount,
             type="limit",
@@ -114,13 +109,24 @@ class OrderBook:
         )
 
     async def open_orders(self):
-        response = await self.client.request(
+        response = await self.request(
             "private/get_open_orders_by_instrument",
-            access_token=self.access_token,
             instrument_name=self.instrument_name,
             type="limit",
         )
         return [Order(**order) for order in response["result"]]
+
+    async def cancel_all(self):
+        await self.request(
+            "private/cancel_all_by_instrument",
+            instrument_name=self.instrument_name,
+            type="limit",
+        )
+
+    async def request(self, method: str, **params):
+        if method.startswith("private/"):
+            params["access_token"] = self.access_token
+        return await self.client.request(method, **params)
 
 
 @dataclasses.dataclass
@@ -153,7 +159,7 @@ class Order:
         if self.filled_amount != self.amount and self.filled_amount != 0:
             order = f"{order} {self.filled_amount}/{self.amount}"
         if self.profit_loss != 0.0:
-            order = f"{order} pnl={1e8 * self.profit_loss} sat"
+            order = f"{order} pnl={int(1e8 * self.profit_loss)} sat"
         return f"{type(self).__name__}({order})"
 
 
@@ -162,16 +168,19 @@ class MarketMaker:
         self.book = book
         self.spread = 1.0
         self.amount = 1000
+        self.total_pnl = 0.0
 
     async def on_start(self):
-        await self.book.login()
+        await self.book.auth()
 
         bid, ask = await self.book.bid_ask()
         print("bid ask", bid, ask)
 
         await self.book.subscribe()
-        await self.book.limit_order("buy", amount=self.amount, price=bid)
-        await self.book.limit_order("sell", amount=self.amount, price=ask)
+        await asyncio.gather(
+            self.book.limit_order("buy", amount=self.amount, price=bid - self.spread),
+            self.book.limit_order("sell", amount=self.amount, price=ask + self.spread),
+        )
 
     async def on_message(self, message: dict):
         if message.get("method") != "subscription":
@@ -181,10 +190,15 @@ class MarketMaker:
         order = Order(**params["data"])
         print(order)
 
-        if order.order_state == "filled" and order.order_type != "stop_limit":
-            if order.profit_loss > 0.0:
-                await self.book.limit_order("buy", amount=self.amount, price=order.price - self.spread)
-                await self.book.limit_order("sell", amount=self.amount, price=order.price + self.spread)
+        if order.order_state == "filled" and order.filled_amount == order.amount:
+            if order.profit_loss != 0.0:
+                self.total_pnl += order.profit_loss
+                print("total pnl =", int(1e8 * self.total_pnl), "sat")
+                await self.book.cancel_all()
+                await asyncio.gather(
+                    self.book.limit_order("buy", amount=self.amount, price=order.price - self.spread),
+                    self.book.limit_order("sell", amount=self.amount, price=order.price + self.spread),
+                )
 
     async def on_heartbeat(self):
         bid, ask = await self.book.bid_ask()
@@ -193,10 +207,14 @@ class MarketMaker:
         buy_prices = set(order.price for order in orders if order.direction == "buy")
         sell_prices = set(order.price for order in orders if order.direction == "sell")
 
-        if bid not in buy_prices:
-            await self.book.limit_order("buy", amount=self.amount, price=bid)
-        if ask not in sell_prices:
-            await self.book.limit_order("sell", amount=self.amount, price=ask)
+        tasks = []
+        buy_price = bid - self.spread
+        if buy_price not in buy_prices:
+            tasks.append(self.book.limit_order("buy", amount=self.amount, price=buy_price))
+        sell_price = ask + self.spread
+        if sell_price not in sell_prices:
+            tasks.append(self.book.limit_order("sell", amount=self.amount, price=sell_price))
+        await asyncio.gather(*tasks)
 
 
 async def main():
