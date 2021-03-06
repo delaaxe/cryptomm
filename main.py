@@ -89,13 +89,13 @@ class OrderBook:
         except KeyError:
             raise Exception(f"Auth error: {response}")
 
-    async def bid_ask(self):
+    async def best_bid_ask(self):
         response = await self.request("public/ticker", instrument_name=self.instrument_name)
         result = response["result"]
         bid, ask = result["best_bid_price"], result["best_ask_price"]
         return bid, ask
 
-    async def subscribe(self):
+    async def subscribe_to_orders(self):
         await self.request("private/subscribe", channels=[f"user.orders.{self.instrument_name}.raw"])
 
     async def limit_order(self, way: t.Literal["buy", "sell"], amount: int, price: float):
@@ -121,6 +121,13 @@ class OrderBook:
             "private/cancel_all_by_instrument",
             instrument_name=self.instrument_name,
             type="limit",
+        )
+
+    async def close_position(self):
+        await self.request(
+            "private/close_position",
+            instrument_name=self.instrument_name,
+            type="market",
         )
 
     async def request(self, method: str, **params):
@@ -163,20 +170,27 @@ class Order:
         return f"{type(self).__name__}({order})"
 
 
-class MarketMaker:
+class Strategy(t.Protocol):
+    async def on_start(self): ...
+    async def on_message(self, message: dict): ...
+    async def on_heartbeat(self): ...
+
+
+class MarketMakingStrategy(Strategy):
     def __init__(self, book: OrderBook):
         self.book = book
-        self.spread = 1.0
+        self.spread = 10.0
         self.amount = 1000
         self.total_pnl = 0.0
 
     async def on_start(self):
         await self.book.auth()
+        await self.book.close_position()
 
-        bid, ask = await self.book.bid_ask()
+        bid, ask = await self.book.best_bid_ask()
         print("bid ask", bid, ask)
 
-        await self.book.subscribe()
+        await self.book.subscribe_to_orders()
         await asyncio.gather(
             self.book.limit_order("buy", amount=self.amount, price=bid - self.spread),
             self.book.limit_order("sell", amount=self.amount, price=ask + self.spread),
@@ -194,37 +208,34 @@ class MarketMaker:
             if order.profit_loss != 0.0:
                 self.total_pnl += order.profit_loss
                 print("total pnl =", int(1e8 * self.total_pnl), "sat")
-                await self.book.cancel_all()
-                await asyncio.gather(
-                    self.book.limit_order("buy", amount=self.amount, price=order.price - self.spread),
-                    self.book.limit_order("sell", amount=self.amount, price=order.price + self.spread),
-                )
+                # await self.book.cancel_all()
+                asyncio.create_task(self.book.limit_order("buy", amount=self.amount, price=order.price - self.spread))
+                asyncio.create_task(self.book.limit_order("sell", amount=self.amount, price=order.price + self.spread))
 
     async def on_heartbeat(self):
-        bid, ask = await self.book.bid_ask()
+        return
+        bid, ask = await self.book.best_bid_ask()
         orders = await self.book.open_orders()
 
         buy_prices = set(order.price for order in orders if order.direction == "buy")
         sell_prices = set(order.price for order in orders if order.direction == "sell")
 
-        tasks = []
         buy_price = bid - self.spread
         if buy_price not in buy_prices:
-            tasks.append(self.book.limit_order("buy", amount=self.amount, price=buy_price))
+            asyncio.create_task(self.book.limit_order("buy", amount=self.amount, price=buy_price))
         sell_price = ask + self.spread
         if sell_price not in sell_prices:
-            tasks.append(self.book.limit_order("sell", amount=self.amount, price=sell_price))
-        await asyncio.gather(*tasks)
+            asyncio.create_task(self.book.limit_order("sell", amount=self.amount, price=sell_price))
 
 
 async def main():
     async with websockets.connect(api_url) as socket:
-        with AsyncClient(socket, heartbeat=10) as client:
+        with AsyncClient(socket, heartbeat=1) as client:
             book = OrderBook(client, instrument_name=ticker)
-            market_maker = MarketMaker(book)
-            client.handle_message = market_maker.on_message
-            client.handle_heartbeat = market_maker.on_heartbeat
-            await market_maker.on_start()
+            strategy = MarketMakingStrategy(book)
+            client.handle_message = strategy.on_message
+            client.handle_heartbeat = strategy.on_heartbeat
+            await strategy.on_start()
             while socket.open:
                 await client.receiver
 
